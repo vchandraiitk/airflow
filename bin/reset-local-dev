@@ -1,0 +1,19 @@
+#!/bin/bash
+set -e
+
+REPO_DIR="$(git rev-parse --show-toplevel)"
+
+"$REPO_DIR/bin/clean-slate"
+
+echo "Deploying Airflow..."
+
+if [[ -z "${EXECUTOR}" ]]; then
+  export EXECUTOR=CeleryExecutor
+fi
+
+helm install \
+  -n airflow \
+  --set executor="$EXECUTOR" \
+  --set workers.persistence.fixPermissions=true \
+  airflow \
+  "$REPO_DIR"

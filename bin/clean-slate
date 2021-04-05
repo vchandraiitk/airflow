@@ -1,0 +1,15 @@
+#!/bin/bash
+
+REPO_DIR="$(git rev-parse --show-toplevel)"
+
+# Install the postgresql subchart
+echo "Installing Helm subchart(s)..."
+helm dep update
+
+echo "Syntax check Helm chart..."
+helm template "$REPO_DIR" > /dev/null 2>&1
+
+echo "Delete existing kind cluster named 'kind' (if it exists)..."
+kind delete cluster > /dev/null 2>&1 || true
+
+"${REPO_DIR}/bin/start-kind-cluster"

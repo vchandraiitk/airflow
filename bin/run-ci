@@ -1,0 +1,120 @@
+#!/bin/bash
+# shellcheck disable=SC1091,SC2181
+set -e
+
+PATH="/tmp/bin:$PATH"
+
+function get_debugging_info {
+  echo "Failed to deploy Airflow!"
+  echo "Printing description and logs where containers in pod are not ready..."
+  for pod in $(kubectl get pods -n airflow | grep -v NAME | grep -v 1/1 | grep -v 2/2 | grep -v 3/3 | grep -v Completed | awk '{ print $1 }'); do
+    echo "======================="
+    set -x
+    kubectl describe pod -n airflow "$pod"
+    kubectl logs -n airflow "$pod" | tail -n 30
+    set +x
+    echo "======================="
+  done
+  kubectl get pods --all-namespaces
+  echo "======================="
+  kubectl get ds --all-namespaces
+  echo "======================="
+  kubectl get sts --all-namespaces
+  echo "======================="
+  kubectl get deployments --all-namespaces
+}
+
+REPO_DIR="$(git rev-parse --show-toplevel)"
+
+if [[ -z "${HELM_CHART_PATH}" ]]; then
+  export HELM_CHART_PATH="$REPO_DIR"
+fi
+
+"$REPO_DIR/bin/clean-slate"
+
+echo "Deploying Airflow..."
+
+kubectl get pods -w &
+WATCH_PID=$!
+
+START=$(date +%s)
+
+set +e
+set -x
+
+export EXECUTOR="${EXECUTOR:-CeleryExecutor}"
+
+# shellcheck disable=SC2086
+helm install \
+  -n airflow \
+  --set executor="$EXECUTOR" \
+  --set pgbouncer.enabled=true \
+  --set pgbouncer.metadataPoolSize=25 \
+  --set pgbouncer.resultBackendPoolSize=25 \
+  --set data.metadataConnection.host="airflow-postgresql.airflow.svc.cluster.local" \
+  --set data.resultBackendConnection.host="airflow-postgresql.airflow.svc.cluster.local" \
+  airflow \
+  $HELM_CHART_PATH
+
+if [[ $? -ne 0 ]] ; then
+  echo "Helm chart failed to install"
+  get_debugging_info
+  exit 1
+fi
+
+HELM_CODE=0
+set +x
+
+# Wait for all pods to become ready
+RC=0
+while [ $RC -eq 0 ]; do
+  NOW=$(date +%s)
+  DURATION="$((NOW-START))"
+  echo "Waiting for all pods to become ready. ${DURATION} seconds have elapsed, timeout at 800 seconds"
+  if [ "$DURATION" -gt 800 ];then
+    HELM_CODE=1
+    RC=1
+    echo "Error (timeout): giving up after 800 seconds"
+  else
+    sleep 10
+    kubectl get pods > /tmp/pods
+    if [[ $? -ne 0 ]] ; then
+      echo "kubectl get pods timed out. retrying."
+      continue
+    fi
+    set +e
+    grep -q -vE '1/1|2/2|3/3|NAME' /tmp/pods
+    RC=$?
+    set -e
+  fi
+done
+
+kill $WATCH_PID
+
+# Output debugging information if the Helm install failed
+if [ "$HELM_CODE" -eq 0 ]; then
+  echo "Airflow deployed!"
+else
+  echo "Failed to deploy Airflow!"
+  get_debugging_info
+  exit 1
+fi
+
+export SCHEDULER_DEPLOYMENT=$(kubectl get deployments -n airflow | grep scheduler |  awk '{ print $1 }')
+AIRFLOW_IMAGE=$(kubectl get deployment/$SCHEDULER_DEPLOYMENT -n airflow -o jsonpath="{$.spec.template.spec.initContainers[0].image}")
+export AIRFLOW_IMAGE
+echo "Airflow Image: $AIRFLOW_IMAGE"
+
+docker pull "$AIRFLOW_IMAGE"
+AIRFLOW_VERSION=$(docker inspect --format '{{ index .Config.Labels "io.astronomer.docker.airflow.version" }}' "$AIRFLOW_IMAGE")
+export AIRFLOW_VERSION
+echo "Airflow Version: $AIRFLOW_VERSION"
+
+pip3 install virtualenv
+virtualenv --python=python3 /tmp/venv
+source /tmp/venv/bin/activate
+pip install -r "$REPO_DIR/tests/functional-tests/requirements.txt"
+export NAMESPACE=airflow
+export RELEASE_NAME=airflow
+pytest "$REPO_DIR/tests/functional-tests/"
+deactivate
